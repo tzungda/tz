@@ -18,14 +18,17 @@ static void repl( )
             printf( "\n" );
             break;
         }
-        
+        //sprintf_s( line, 1024, "%s\0", line );
+        size_t len = strlen( line );
+        line[len-1] = '\0';
         interpret( line );
     }
 }
 
 static char* readFile( const char* path )
 {
-    FILE* file = fopen( path, "rb" );
+    FILE* file = 0;
+    fopen_s( &file, path, "rb" );
     if ( !file )
     {
         fprintf( stderr, "Could not open file \"%s\".\n", path );

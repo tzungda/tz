@@ -9,6 +9,7 @@ typedef struct
 {
     const char* start;
     const char* current;
+    int line;
 } Scanner;
 
 Scanner scanner;
@@ -20,9 +21,9 @@ void initScanner( const char* source )
     scanner.line = 1;
 }
 
-static book isAlpha( char c )
+static bool isAlpha( char c )
 {
-    return ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' ) || c == '_' );
+    return ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' ) || c == '_'  ;
 }
 
 static bool isDigit( char c )
@@ -231,7 +232,7 @@ Token scanToken()
         case '<':
             return makeToken( match( '=' ) ? TOKEN_LESS_EQUAL : TOKEN_LESS );
         case '>':
-            return makeToken( match( '=' ) ? TOKEN_GREATER_EQUAL : TOKEN_GREATEr );
+            return makeToken( match( '=' ) ? TOKEN_GREATER_EQUAL : TOKEN_GREATER );
         case '"': return string();
     }
     

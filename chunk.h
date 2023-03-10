@@ -7,10 +7,19 @@
 typedef enum
 {
     OP_CONSTANT,
+    OP_NIL,
+    // (p.334) it can still use OP_CONSTANT for both ture and false, but it will take two byte for each in the buffer.
+    // separating them to save the space
+    OP_TRUE,
+    OP_FALSE, 
+    OP_EQUAL,
+    OP_GREATER,
+    OP_LESS,
     OP_ADD,
     OP_SUBTRACT,
     OP_MULTIPLY,
     OP_DIVIDE,
+    OP_NOT,
     OP_NEGATE,
     OP_RETURN,
 } OpCode;
