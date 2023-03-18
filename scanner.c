@@ -81,7 +81,7 @@ static Token errorToken( const char* message )
     return token;
 }
 
-static void skipWhitespanceAndComment( )
+static void skipWhitespaceAndComment( )
 {
     for( ; ; )
     {
@@ -92,6 +92,10 @@ static void skipWhitespanceAndComment( )
             case '\r':
             case '\t':
                 advance();
+                break;
+            case '\n':
+                scanner.line++;
+                advance( );
                 break;
             case '/':
                 if( peekNext() == '/' )
@@ -185,9 +189,10 @@ static Token number()
 
 static Token string( )
 {
-    while ( peek() != '"' && isAtEnd() )
+    while ( peek() != '"' && !isAtEnd() )
     {
-        if ( peek() == '\n' ) scanner.line++;
+        if ( peek() == '\n' ) 
+            scanner.line++;
         advance();
     }
     
@@ -200,7 +205,7 @@ static Token string( )
 
 Token scanToken()
 {
-    skipWhitespanceAndComment( );
+    skipWhitespaceAndComment( );
     
     scanner.start = scanner.current;
     

@@ -11,6 +11,7 @@ typedef struct
 	uint8_t *ip; // instruction pointer, this points to the next instruction that about to execute
 	Value stack[STACK_MAX];
 	Value* stackTop;
+	Obj* objects;
 } VM;
 
 typedef enum
@@ -20,6 +21,7 @@ typedef enum
 	INTERPRET_RUNTIME_ERROR
 } InterpretResult;
 
+extern VM vm;
 
 void initVM();
 void freeVM(); 
