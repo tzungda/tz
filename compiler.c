@@ -148,7 +148,10 @@ static void defineVariable( uint8_t global ); // p.389
 static void expression();
 static void varDeclaration();//p.388
 static void expressionStatement();
+static void forStatement();//p.425
+static void ifStatement( );//p.415
 static void printStatement();
+static void whileStatement();
 static void synchronize();
 static void statement();
 static void declaration();
@@ -185,10 +188,38 @@ static void emitByte( uint8_t byte )
     writeChunk( currentChunk(), byte, parser.previous.line );
 }
 
+static void emitLoop( int loopStart ) //p.423
+{
+    // emit a new loop instruction, which unconditionally jumps 'backwards' by a given offset
+    emitByte( OP_LOOP );
+
+    // the +2 is to take into account the size of the OP_LOOP instruction's own operands which we also need to jump over
+    int offset = currentChunk()->count - loopStart + 2;
+    if( offset > UINT16_MAX )
+        error( "Loop body too large." );
+
+    emitByte( (offset >> 8) & 0xff );
+    emitByte( offset & 0xff );
+}
+
 static void emitBytes( uint8_t byte1, uint8_t byte2 )
 {
     emitByte( byte1 );
     emitByte( byte2 );
+}
+
+static int emitJump( uint8_t instruction ) //p.416
+{
+    // emits a bytecode instruction and writes a placeholder operand for the jump offset
+    //
+    emitByte( instruction );
+    // use two bytes for the jump offset operand. 
+    // a 16-bit offset let us jump over up to 65,535 bytes of code
+    emitByte( 0xff ); // 0xff is 8 bits
+    emitByte( 0xff );
+
+    // returns the offset of the emitted instruction in the chunk.
+    return currentChunk()->count - 2;
 }
 
 static void emitReturn()
@@ -211,6 +242,25 @@ static uint8_t makeConstant( Value value )
 static void emitConstant( Value value )
 {
     emitBytes( OP_CONSTANT, makeConstant( value ) );
+}
+
+// p.416 After compiling the then branch, we take that offset and pass it to this
+// we call patchJump right before we emit the next instruction that we want the jump the land on
+static void patchJump( int offset )
+{
+    // -2 to adjust for the bytecode for the jump offset itself
+    int jump = currentChunk()->count - offset - 2;
+
+    if ( jump > UINT16_MAX )
+    {
+        error( "Too much code to jump ofer." );
+    }
+
+    // goes back into the bytecode and replaces the operand at the given location with the calculated jump offset
+    uint8_t tmp = ( jump >> 8 ) & 0xff;
+    currentChunk()->code[offset] = tmp;
+    tmp = jump & 0xff;
+    currentChunk()->code[offset + 1] = tmp;
 }
 
 static void initCompiler( Compiler* compiler )
@@ -345,6 +395,28 @@ static void unary( bool canAssign )
     }
 }
 
+static void and_( bool canAssign ) // p.420
+{
+    int endJump = emitJump( OP_JUMP_IF_FALSE );
+
+    emitByte( OP_POP );
+    parsePrecedence( PREC_AND );
+
+    patchJump( endJump );
+}
+
+static void or_( bool canAssign ) // p.421
+{
+    int elseJump = emitJump( OP_JUMP_IF_FALSE );
+    int endJump = emitJump( OP_JUMP );
+
+    patchJump( elseJump );
+    emitByte( OP_POP );
+
+    parsePrecedence( PREC_OR );
+    patchJump( endJump );
+}
+
 // the table that drives whole parser is an array of ParseRules(p.319)
 ParseRule rules[] = 
 {
@@ -370,7 +442,7 @@ ParseRule rules[] =
     [TOKEN_IDENTIFIER]      = { variable, NULL, PREC_NONE},
     [TOKEN_STRING]          = { string, NULL, PREC_NONE},
     [TOKEN_NUMBER]          = { number, NULL, PREC_NONE},
-    [TOKEN_AND]             = { NULL, NULL, PREC_NONE},
+    [TOKEN_AND]             = { NULL, and_, PREC_NONE},
     [TOKEN_CLASS]           = { NULL, NULL, PREC_NONE},
     [TOKEN_ELSE]            = { NULL, NULL, PREC_NONE},
     [TOKEN_FALSE]           = { literal, NULL, PREC_NONE},
@@ -378,7 +450,7 @@ ParseRule rules[] =
     [TOKEN_FUN]             = { NULL, NULL, PREC_NONE},
     [TOKEN_IF]              = { NULL, NULL, PREC_NONE},
     [TOKEN_NIL]             = { literal, NULL, PREC_NONE},
-    [TOKEN_OR]              = { NULL, NULL, PREC_NONE},
+    [TOKEN_OR]              = { NULL, or_, PREC_NONE},
     [TOKEN_PRINT]           = { NULL, NULL, PREC_NONE},
     [TOKEN_RETURN]          = { NULL, NULL, PREC_NONE},
     [TOKEN_SUPER]           = { NULL, NULL, PREC_NONE},
@@ -553,6 +625,105 @@ static void expressionStatement() // p.386
     emitByte( OP_POP );
 }
 
+static void forStatement() //p.425
+{
+    // if a 'for' statement declares a variable, that variable should be scoped to the loop body
+    beginScope();
+
+    consume( TOKEN_LEFT_PAREN, "Expect '(' after 'for'." );
+
+    // we allow eith a variable declaration or an expression
+    if( match( TOKEN_SEMICOLON ) )
+    {
+        // no initializer
+    }
+    else if ( match( TOKEN_VAR ) )
+    {
+        varDeclaration();
+    }
+    else
+    {
+        // here we call expressionStatement() instead of expression(). That looks for a semicolon, which we need here too,
+        // and also emits an OP_POP instruction to discard the value. We don't want the initializer to leave anything on the stack.
+        expressionStatement();
+    }
+
+    int loopStart = currentChunk()->count;
+    int exitJump = -1;// for the condition expression that can be used to exit the loop
+    if( !match( TOKEN_SEMICOLON ) )
+    {
+        expression();
+        consume( TOKEN_SEMICOLON, "Expect ';' after loop condition." );
+
+        // jump out of the loop if the condition is false
+        exitJump = emitJump( OP_JUMP_IF_FALSE );
+        emitByte( OP_POP ); // condition
+    }
+    
+    // for increment clause
+    if ( !match( TOKEN_RIGHT_PAREN ) ) // p.427
+    {
+        // first we imit an unconditional jump that hops over the increment clause's code to the body of the loop
+        int bodyJump = emitJump( OP_JUMP );
+
+        // next we compile the increment expression itself. this is usually an assignment
+        int incrementStart = currentChunk()->count;
+        expression();
+        // we only execute it for its side-effect, so we also emit a pop to discard its value
+        emitByte( OP_POP );
+        consume( TOKEN_RIGHT_PAREN, "Expect ')' after for clauses." );
+
+        // emit the loop instruction. this is the main loop that takes us back to the top of the 'for' loop
+        // right before the condition expression if there is one
+        // ( the increment executes at the end of each loop iteration )
+        emitLoop( loopStart );
+        // then we change loopStart to point to the offset where the increment expression begins.
+        // later, when we emit the loop instruction after the body statement, this will cause it jump up to
+        // the 'increment' expression instead of the top of the loop like it does when there is no increment
+        loopStart = incrementStart;
+        patchJump( bodyJump );
+    }
+
+    statement();
+    emitLoop( loopStart );
+
+    if ( exitJump != -1 ) //<- check there is a condition clause
+    {
+        patchJump( exitJump );
+        emitByte( OP_POP ); //condition
+    }
+
+    //
+    endScope();
+}
+
+static void ifStatement( )
+{
+    consume( TOKEN_LEFT_PAREN, "Expect '(' after 'if'.");
+    expression();
+    consume( TOKEN_RIGHT_PAREN, "Expect ')' after condition." );
+
+    // p.415: Emit a new OP_JUMP_IF_FALSE instruction. It has an operand for how much to offset the ip
+    // i.e. how many bytes of code to skip.
+    int thenJump = emitJump( OP_JUMP_IF_FALSE );
+    //p.419 when the condition is truthy, we pop it right before the code inside the then branch
+    emitByte( OP_POP );
+    statement();
+
+    //we need another jump from the end of the then branch
+    int elseJump = emitJump( OP_JUMP );
+
+    patchJump( thenJump );
+    //p.419 Otherwise, we pop it at the beginning of the else branch.
+    // every 'if' statement has an implicit else branch even if the user didn't write and 'else' clause
+    emitByte( OP_POP );
+
+    // compile the else keyword if we find one
+    if( match( TOKEN_ELSE ) )
+        statement();
+    patchJump( elseJump );
+}
+
 static void block( )
 {
     while ( !check( TOKEN_RIGHT_BRACE ) && !check( TOKEN_EOF ) )
@@ -568,6 +739,28 @@ static void printStatement()
     expression();
     consume( TOKEN_SEMICOLON, "Expect ';' after value." );
     emitByte( OP_PRINT );
+}
+
+static void whileStatement()//p.422
+{
+    //capture the loopStart(right before the condition expression) position.
+    // We store the chunk's current instruction count in loopStart to record the offset in the bytecode right before
+    // the condition expression we're about the compile
+    int loopStart = currentChunk()->count;
+
+    consume( TOKEN_LEFT_PAREN, "Expect '(' after 'while'. " );
+    expression( );
+    consume( TOKEN_RIGHT_PAREN, "Expect ')' after condition. " );
+
+    int exitJump = emitJump( OP_JUMP_IF_FALSE );
+    emitByte( OP_POP );
+    statement();
+
+    // the only difference from an 'if' statement is the loop
+    emitLoop( loopStart );
+
+    patchJump( exitJump );
+    emitByte( OP_POP );
 }
 
 static void synchronize() // p.387
@@ -617,6 +810,18 @@ static void statement()
     if( match( TOKEN_PRINT ) )
     {
         printStatement();
+    }
+    else if ( match( TOKEN_FOR ) )
+    {
+        forStatement();
+    }
+    else if ( match( TOKEN_IF ) )
+    {
+        ifStatement(); //p.414
+    }
+    else if ( match( TOKEN_WHILE ) ) //p.422
+    {
+        whileStatement();
     }
     else if( match( TOKEN_LEFT_BRACE ) ) // p.403
     {
