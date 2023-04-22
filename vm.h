@@ -1,15 +1,24 @@
 #ifndef tz_vm_h
 #define tz_vm_h
 
-#include "chunk.h"
+#include "object.h"
 #include "table.h"
 
-#define STACK_MAX 256
+#define FRAMES_MAX 64
+#define STACK_MAX ( FRAMES_MAX * UINT8_MAX )
+
+//p.422: A CallFrame represents a single ongoing function call
+typedef struct
+{
+	ObjFunction* function;
+	uint8_t* ip; // Instead of storing the return address in the callee's frame, the caller stores its own ip
+	Value* slots; // points into the VM's value stack at the first slot that this function can use
+} CallFrame; 
 
 typedef struct
 {
-	Chunk* chunk;
-	uint8_t *ip; // instruction pointer, this points to the next instruction that about to execute
+	CallFrame frames[FRAMES_MAX]; //p.443
+	int frameCount;
 	Value stack[STACK_MAX];
 	Value* stackTop;
 	Table globals;
