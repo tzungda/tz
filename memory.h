@@ -20,6 +20,9 @@
 	reallocate( pointer, sizeof( type ) * ( oldCount ), 0 )
 
 void* reallocate( void* pointer, size_t oldSize, size_t newSize );
+void markObject( Obj* object ); //p.506
+void markValue( Value value ); //p.505
+void collectGarbage(); //p.503
 void freeObjects();
 
 #endif

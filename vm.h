@@ -10,7 +10,7 @@
 //p.422: A CallFrame represents a single ongoing function call
 typedef struct
 {
-	ObjFunction* function;
+	ObjClosure* closure;
 	uint8_t* ip; // Instead of storing the return address in the callee's frame, the caller stores its own ip
 	Value* slots; // points into the VM's value stack at the first slot that this function can use
 } CallFrame; 
@@ -23,7 +23,17 @@ typedef struct
 	Value* stackTop;
 	Table globals;
 	Table strings;
+	ObjString* initString;//p.557
+	ObjUpvalue* openUpvalues; //p.488
 	Obj* objects;
+	// p.511
+	int grayCount;
+	int grayCapacity;
+	Obj** grayStack;
+	//p.519
+	size_t bytesAllocated;// running total of the number of bytes of managed memory the VM has allocated
+	size_t nextGC;// the threshold that triggers the next collection
+
 } VM;
 
 typedef enum

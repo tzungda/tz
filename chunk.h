@@ -16,8 +16,13 @@ typedef enum
     OP_GET_LOCAL, //p.409
     OP_SET_LOCAL,
     OP_GET_GLOBAL, //p.391
+    OP_GET_UPVALUE,
+    OP_SET_UPVALUE, //p.472
     OP_DEFINE_GLOBAL,
     OP_SET_GLOBAL,
+    OP_SET_PROPERTY,//p.536
+    OP_GET_PROPERTY,//p.536
+    OP_GET_SUPER,//p.576
     OP_EQUAL,
     OP_GREATER,
     OP_LESS,
@@ -32,7 +37,14 @@ typedef enum
     OP_JUMP_IF_FALSE,
     OP_LOOP,
     OP_CALL,
+    OP_INVOKE, //p.560 special instruction that performs an optimized method call
+    OP_CLOSURE,//p.467 
+    OP_SUPER_INVOKE,//p.578
+    OP_CLOSE_UPVALUE, //p.487
     OP_RETURN,
+    OP_CLASS, //p.530
+    OP_INHERIT, //569
+    OP_METHOD //p.545
 } OpCode;
 
 typedef struct

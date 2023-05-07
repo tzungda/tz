@@ -5,6 +5,7 @@
 
 #include "common.h"
 #include "compiler.h"
+#include "memory.h"
 #include "scanner.h"
 
 #ifdef DEBUG_PRINT_CODE
@@ -52,26 +53,53 @@ typedef struct
 {
     Token name;
     int depth;
+    bool isCaptured;//p.486
 } Local;
+
+//p.474
+typedef struct
+{
+    uint8_t index;
+    bool isLocal;
+} Upvalue;
 
 typedef enum
 {
     TYPE_FUNCTION,
+    //p.558 a new function type to distinguish initializers from other methods
+    TYPE_INITIALIZER,
+    //p.553 To decide what name to give to local slot zero, the compiler needs to know whether it's compiling a function or method declaration,
+    // so we add a new case to our FunctionType enum to distinguish methods.
+    TYPE_METHOD,
     TYPE_SCRIPT // for the cnode not in functions
 } FunctionType; //p.437
 
-typedef struct
+typedef struct Compiler
 {
     struct Compiler* enclosing;//p.448
     ObjFunction* function; //p.436: a reference to the function being built
     FunctionType type;
     Local locals[UINT8_COUNT];
     int localCount;
+    //p.474 the OP_GET_UPVALUE and OP_SET_UPVALUE instructions encode an upvalue index using a single byte operand,
+    // so there is a restriction on how many upvalues a function can have -- how many unique variables it can close over
+    Upvalue upvalues[UINT8_COUNT];
     int scopeDepth;
 } Compiler;
 
+//p.554
+typedef struct ClassCompiler
+{
+    struct ClassCompiler* enclosing;
+    //p.573
+    bool hasSuperclass;
+} ClassCompiler;
+
 Parser parser;
 Compiler* current = NULL; 
+//p.554 This module variable points to a struct representing the current, innermost class being compiled.
+// If we aren't inside any class declaration at all, the module variable currentClass is NULL.
+ClassCompiler* currentClass = NULL;
 
 static Chunk* currentChunk()
 {
@@ -170,6 +198,7 @@ static ParseRule* getRule( TokenType type );
 static ObjFunction* endCompiler( );
 static void beginScope();
 static void endScope();
+static int resolveUpvalue( Compiler* compiler, Token* name );//p.472
 
 ObjFunction* compile( const char* source )
 {
@@ -189,6 +218,16 @@ ObjFunction* compile( const char* source )
 
     ObjFunction* function = endCompiler();
     return parser.hadError ? NULL : function;
+}
+
+void markCompilerRoots( ) //p.508
+{
+    Compiler* compiler = current;
+    while( compiler != NULL )
+    {
+        markObject( (Obj*)compiler->function );
+        compiler = compiler->enclosing;
+    }
 }
 
 static void emitByte( uint8_t byte )
@@ -233,9 +272,19 @@ static int emitJump( uint8_t instruction ) //p.416
 
 static void emitReturn()
 {
+    // p.558 Whenever the compiler emits the implicit return at the end of a body, we check the type to decide 
+    // whether to insert the initializer-specific behavior
+    if ( current->type == TYPE_INITIALIZER )
+    {
+        emitBytes( OP_GET_LOCAL, 0 );
+    }
+    else
+    {
+        emitByte( OP_NIL );
+    }
     //p.457 The compiler calls emitReturn() to write the OP_RETURN instruction at the end of a function body
     // Now, before that, it emits an instruction to push nil onto the stack.
-    emitByte( OP_NIL );
+    //emitByte( OP_NIL );
     emitByte( OP_RETURN );
 }
 
@@ -296,8 +345,18 @@ static void initCompiler( Compiler* compiler, FunctionType type )
     // p.438
     Local* local = &current->locals[current->localCount++];
     local->depth = 0;
-    local->name.start = "";
-    local->name.length = 0;
+    local->isCaptured = false;//p.486
+    //p.552 In order to compile [this] expressions, the compiler simply needs to give the correct name to that local variable.
+    if ( type != TYPE_FUNCTION )
+    {
+        local->name.start = "this";
+        local->name.length = 4;
+    }
+    else
+    {
+        local->name.start = "";
+        local->name.length = 0;
+    }
 }
 
 static ObjFunction* endCompiler( )
@@ -327,7 +386,17 @@ static void endScope()
     while( current->localCount > 0 && 
         current->locals[current->localCount - 1].depth > current->scopeDepth )
     {
-        emitByte( OP_POP );
+        // p.486 the instruction requires no operand. 
+        // we know that that variable will always be right on top of the stack at the point that this 
+        if ( current->locals[current->localCount - 1].isCaptured )
+        {
+            emitByte( OP_CLOSE_UPVALUE );
+        }
+        else
+        {
+            emitByte( OP_POP );
+        }
+
         current->localCount--;
     }
 }
@@ -357,6 +426,36 @@ static void call( bool canAssign ) //p.450
 {
     uint8_t argCount = argumentList();
     emitBytes( OP_CALL, argCount ); // OP_CALL here is to invoke the function
+}
+
+static void dot( bool canAssign ) //p.535
+{
+    // The parser expects to find a property name immediately after the dot
+    consume( TOKEN_IDENTIFIER, "Expect property name after '.'." );
+    uint8_t name = identifierConstant( &parser.previous );
+
+    // if we see an equals sign after the field name, it must be a set expression that is assigning to a field
+    if( canAssign && match( TOKEN_EQUAL ) )
+    {
+        expression( );
+        emitBytes( OP_SET_PROPERTY, name );
+    }
+    //p.560 After the compiler has parsed the property name, we look for a left paranthesis.
+    // If we match one, we switch to a new code path.
+    else if ( match( TOKEN_LEFT_PAREN ) )
+    {
+        uint8_t argCount = argumentList();
+        // It takes two operands
+        // (In other words, this single instruction combines the operands of the OP_GET_PROPERTY and OP_CALL instructions it replaces, in that order)
+        //1. The index of the property name in the constant table
+        emitBytes( OP_INVOKE, name );
+        //2. The number of arguemnt passed to the method
+        emitByte( argCount );
+    }
+    else
+    {
+        emitBytes( OP_GET_PROPERTY, name );
+    }
 }
 
 static void literal( bool canAssign )
@@ -396,6 +495,11 @@ static void namedVariable( Token name, bool canAssign )
         getOp = OP_GET_LOCAL;
         setOp = OP_SET_LOCAL;
     }
+    else if ( ( arg = resolveUpvalue( current, &name ) ) != -1 )
+    {
+        getOp = OP_GET_UPVALUE;
+        setOp = OP_SET_UPVALUE;
+    }
     else
     {
         arg = identifierConstant( &name );
@@ -417,6 +521,75 @@ static void namedVariable( Token name, bool canAssign )
 static void variable( bool canAssign )
 {
     namedVariable( parser.previous, canAssign );
+}
+
+//p.573 a little helper function to create a synthetic token for the given constant string
+static Token syntheticToken( const char* text )
+{
+    Token token;
+    token.start = text;
+    token.length = (int)strlen( text );
+    return token;
+}
+
+//p.574 
+static void super_( bool canAssign )
+{
+    // p.576 A super call is meaningful only inside the body of a method, 
+    // and only inside the method of a class that has a superclass
+    if ( currentClass == NULL )
+    {
+        error( "Can't use 'super' outside of a class." );
+    }
+    else if ( !currentClass->hasSuperclass )
+    {
+        error( "Can't use 'super' in a class with no superclass." );
+    }
+
+    // a super call begins, naturally enough, with the super keyword.
+    consume( TOKEN_DOT, "Expect '.' after 'super'." );
+    // unlike [this], and [super] token is not a standalone expression.
+    // when the compiler hits a [super] token, we consume the subsequent . token and then look for a method name.
+    consume( TOKEN_IDENTIFIER, "Expect superclass method name." );
+    uint8_t name = identifierConstant( &parser.previous );
+
+    //p.575
+    // In order to access a superclass method on the current instance, the runtime needs both the receiver and the superclass of the surrounding method's class.
+    // The first namedVariable() call generates code to look up the current receiver stored in the hidden variable "this" and push it onto the stack.
+    // The second namedVariable() call emits code to look up the superclass from its "super" variable and push that on top
+    namedVariable( syntheticToken("this"), false );
+    //p.578 before we emit anything, we look for a parenthesized argument list. If we find one, we compile that.
+    // Then we load the superclass. After that, we emit a new OP_SUPER_INVOKE instruction. This superinstruction combines
+    // the behavior of OP_GET_SUPER and OP_CALL, so it take two operands: the constant table index of the method name
+    // to look up and the number of arguments to pass to it
+    if ( match( TOKEN_LEFT_PAREN ) )
+    {
+        uint8_t argCount = argumentList();
+        namedVariable( syntheticToken("super"), false );
+        emitBytes( OP_SUPER_INVOKE, name );
+        emitByte( argCount );
+    }
+    else // otherwise, if we don't find a '(', we continue to compile the expression as a super access like we did before and emit an OP_GET_SUPER
+    {
+        namedVariable( syntheticToken( "super" ), false );
+        emitBytes( OP_GET_SUPER, name );
+    }
+
+}
+
+static void this_( bool canAssign ) //p.551
+{
+    //p.555 to see if we are inside a class - and therefore inside a method - we simply check that module variable.
+    if( currentClass == NULL )
+    {
+        error( "Can't use 'this' outside of a class." );
+        return;
+    }
+
+    // When the parser function is called, the [this] token has just been consumed and is stored as the previous token.
+    // We call our existing variable() function which compiles identifier expressions as variable accesses.
+    // You can't assign the [this], so we pass 'false' to disallow that.
+    variable( false );
 }
 
 static void unary( bool canAssign )
@@ -465,7 +638,7 @@ ParseRule rules[] =
     [TOKEN_LEFT_BRACE]      = { NULL, NULL, PREC_NONE},
     [TOKEN_RIGHT_BRACE]     = { NULL, NULL, PREC_NONE},
     [TOKEN_COMMA]           = { NULL, NULL, PREC_NONE},
-    [TOKEN_DOT]             = { NULL, NULL, PREC_NONE},
+    [TOKEN_DOT]             = { NULL, dot, PREC_CALL},//p.535 precedece as high as the parenthese
     [TOKEN_MINUS]           = { unary, binary, PREC_TERM},
     [TOKEN_PLUS]            = { NULL, binary, PREC_TERM},
     [TOKEN_SEMICOLON]       = { NULL, NULL, PREC_NONE},
@@ -493,8 +666,8 @@ ParseRule rules[] =
     [TOKEN_OR]              = { NULL, or_, PREC_NONE},
     [TOKEN_PRINT]           = { NULL, NULL, PREC_NONE},
     [TOKEN_RETURN]          = { NULL, NULL, PREC_NONE},
-    [TOKEN_SUPER]           = { NULL, NULL, PREC_NONE},
-    [TOKEN_THIS]            = { NULL, NULL, PREC_NONE},
+    [TOKEN_SUPER]           = { super_, NULL, PREC_NONE},//p.574
+    [TOKEN_THIS]            = { this_, NULL, PREC_NONE},//p.551
     [TOKEN_TRUE]            = { literal, NULL, PREC_NONE},
     [TOKEN_VAR]             = { NULL, NULL, PREC_NONE},
     [TOKEN_WHILE]           = { NULL, NULL, PREC_NONE},
@@ -560,6 +733,54 @@ static int resolveLocal( Compiler* compiler, Token* name )
     return -1;
 }
 
+static int addUpvalue( Compiler* compiler, uint8_t index, bool isLocal )//p.473
+{
+    int upvalueCount = compiler->function->upvalueCount;
+
+    if ( upvalueCount == UINT8_COUNT )
+    {
+        error( "Too many closure variables in function." );
+        return 0;
+    }
+
+    // we first check to see if the function already has an upvalue that closes over that variable
+    for( int i = 0; i < upvalueCount; i++ )
+    {
+        Upvalue* upvalue = &compiler->upvalues[i];
+        if ( upvalue->index == index && upvalue->isLocal == isLocal )
+        {
+            return i;
+        }
+    }
+
+    compiler->upvalues[upvalueCount].isLocal = isLocal;
+    compiler->upvalues[upvalueCount].index = index;
+    return compiler->function->upvalueCount++;
+}
+
+static int resolveUpvalue( Compiler* compiler, Token* name ) //p.472
+{
+    if( compiler->enclosing == NULL )
+        return -1;
+
+    int local = resolveLocal( compiler->enclosing, name );
+    if( local != -1 )
+    {
+        // p.486
+        // if we end up creating an upvalue for a local variable, we mark itas captured
+        compiler->enclosing->locals[local].isCaptured = true;
+
+        return addUpvalue( compiler, (uint8_t)local, true );
+    }
+
+    //p.477
+    int upvalue = resolveUpvalue( compiler->enclosing, name );
+    if( upvalue != -1 )
+        return addUpvalue( compiler, (uint8_t)upvalue, false );
+
+    return -1;
+}
+
 static void addLocal( Token name ) // p.405
 {
     if ( current->localCount == UINT8_COUNT )
@@ -576,6 +797,9 @@ static void addLocal( Token name ) // p.405
     // - When we declare a local, we need to indicate the "uninitialized" state somehow
     // we'll set the variable's scope depth to a special sentinel value, -1.
     local->depth = -1;
+
+    // p.486
+    local->isCaptured = false;
 }
 
 static void declareVariable() // p.405
@@ -820,7 +1044,123 @@ static void function( FunctionType type ) //p.447
     block();
 
     ObjFunction* function = endCompiler();
-    emitBytes(  OP_CONSTANT, makeConstant( OBJ_VAL(function) ) );
+    emitBytes( OP_CLOSURE/*p.467*/, makeConstant( OBJ_VAL(function) ) );
+
+    //p.478 The OP_CLOSURE instruction is unique in that it has a variably sized encoding.
+    // For each upvalue the closure captures, there are two single-byte operands. 
+    // Each pair of operands specifies what that upvalue captures
+    for ( int i = 0; i < function->upvalueCount; i++ )
+    {
+        emitByte( compiler.upvalues[i].isLocal ? 1 : 0 );
+        emitByte( compiler.upvalues[i].index );
+    }
+}
+
+//p.543 
+static void method( )
+{
+    consume( TOKEN_IDENTIFIER, "Expect method name." );
+    // Like OP_GET_PROPERTY and other instructions that need names at runtime,
+    // the compiler adds the method name token's lexeme to the constant table, getting back a table index
+    uint8_t constant = identifierConstant( &parser.previous );
+
+    FunctionType type = TYPE_METHOD;//p.553 when we compile a method, we use that type
+    // p.558 We detect that by checking to see if the name of the method we're compiling is "init"
+    if( parser.previous.length == 4 && memcmp( parser.previous.start, "init", 4 ) == 0 )
+    {
+        type = TYPE_INITIALIZER;
+    }
+
+    function( type );// closure for the method body
+
+    // name of the method
+    emitBytes( OP_METHOD, constant );
+}
+
+//p.530
+static void classDeclaration()
+{
+    //immediately afer the class keyword is the class's name
+    consume( TOKEN_IDENTIFIER, "Expect class name." );
+    //p.544 The compiler does know the name of the class. We can capture it right after we consume its token
+    Token className = parser.previous;
+    //the compiler needs to stuff the name string somewhere that the runtime can find
+    uint8_t nameConstant = identifierConstant( &parser.previous );
+    //the class's name is also used to bind the class object to a variable of the same name
+    declareVariable();
+
+    //emit a new instruction to actually create the class object at runtime
+    emitBytes( OP_CLASS, nameConstant );
+
+    //Declaring the variable adds it to the scope, but recall from a previous chapter that we can't use
+    //the variable until it's defined.
+    defineVariable( nameConstant );
+
+    //p.555 The memory for the ClassCompiler struct livess right on the C stack, 
+    // a handy capability we get by writing our compiler using recursive descent.
+    ClassCompiler classCompiler;
+    classCompiler.hasSuperclass = false;//p.573
+    classCompiler.enclosing = currentClass;
+    currentClass = &classCompiler;
+
+    // p.568
+    if ( match( TOKEN_LESS ) )
+    {
+        // After we compile the class name, if the next token is a <, then we found a supperclass clause
+        consume( TOKEN_IDENTIFIER, "Expect superclass name." );
+        // We consume the superclass's identifier token, then call variable().
+        // The function takes the previously consumed token, treats it as a variable reference, and emits code to loadthe variable's value
+        // In other words, it looks up the superclass by name and pushes it onto the stack.
+        variable( false );
+
+        //p.569
+        if ( identifiersEqual( &className, &parser.previous ) )
+        {
+            error( "A class can't inherit from itself." );
+        }
+
+        //p.572 we create a new scope and make it a local variable.
+        // Createing a new lexical scope ensures that if we declare two classes in the same scope,
+        // each has a different local slot to store its superclass.
+        beginScope();
+        addLocal( syntheticToken( "super" ) );
+        defineVariable( 0 );
+
+        // we call namedVariable() to load the subclass doing the inheritng onto the stack, followed by an OP_INHERIT instruction
+        namedVariable( className, false );
+        // That instruction wires up the superclass to the new subclass.
+        // The OP_INHERIT instruction takes an existing class and applies the effect of inheritance to it.
+        emitByte( OP_INHERIT );
+        // p.574 if we see a superclass clause, we know we are compiling a subclass
+        classCompiler.hasSuperclass = true;
+    }
+
+    //p.544
+    // Before we start binding methods, we emit whatever code is necessary to load the class back on top of the stack
+    // This helper function generates code to load a variable with the given name onto the stack. 
+    // Then we compile the methods
+    namedVariable( className, false );
+
+    // compile the body
+    consume( TOKEN_LEFT_BRACE, "Expect '{' before class body." );
+    //p.543 anything before the closing brace at the end of the class body must be a method
+    while ( !check( TOKEN_RIGHT_BRACE ) && !check( TOKEN_EOF ) )
+    {
+        method();
+    }
+    consume( TOKEN_RIGHT_BRACE, "Expect '}' before class body." );
+
+    //p.544 Once we've reached the end of the methods, we no longer need the class and tell the VM to pop it off the stack
+    emitByte( OP_POP );
+
+    //p.573 we pop the scope and discard the "super" variable after compiling the class body and its methods.
+    if ( classCompiler.hasSuperclass )
+    {
+        endScope();
+    }
+
+    //p.555 When an outermost class body ends, enclosing will be NULL, so this resets currentClass to NULL.
+    currentClass = currentClass->enclosing;
 }
 
 static void funDeclaration() //p.446
@@ -851,6 +1191,12 @@ static void returnStatement( ) //p.457
     }
     else
     {
+        //p.559 making it an error to try to return anything else from an initializer
+        if ( current->type == TYPE_INITIALIZER )
+        {
+            error( "Can't return a value from an initializer." );
+        }
+
         expression();
         consume( TOKEN_SEMICOLON, "Expect ';' after return values." );
         emitByte( OP_RETURN );
@@ -908,7 +1254,11 @@ static void synchronize() // p.387
 
 static void declaration()
 {
-    if ( match( TOKEN_FUN ) )
+    if ( match( TOKEN_CLASS ) )
+    {
+        classDeclaration();
+    }
+    else if ( match( TOKEN_FUN ) )
     {
         funDeclaration( );
     }
